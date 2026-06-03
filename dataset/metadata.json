@@ -1,0 +1,18 @@
+[
+	{
+		"file": "pima_diabetes.csv",
+		"name": "Pima Indians Diabetes Database",
+		"url": "https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database",
+		"license": "CC0: Public Domain",
+		"owner": "UCI Machine Learning",
+        "date": "Fri Oct 07 2016 01:31:56 GMT+0700"
+	},
+    {
+        "file": "diabetes_risk_dataset.csv",
+        "name": "Diabetes Risk Dataset",
+        "url": "https://www.kaggle.com/datasets/smayanj/diabetes-risk-dataset",
+        "license": "CC0: Public Domain",
+        "owner": "AJ",
+        "date": "Sat Apr 12 2025 23:35:18 GMT+0700"
+    }
+]
