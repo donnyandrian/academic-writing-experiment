@@ -13,10 +13,11 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import matplotlib.pyplot as plt
+import cupy as cp
+import scipy.stats as stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, f1_score, ConfusionMatrixDisplay
-import cupy as cp
 
 # Impor SMOTE secara aman
 try:
@@ -28,9 +29,11 @@ except ImportError:
 print(f"numpy\t\t\t: {np.__version__}")
 print(f"pandas\t\t\t: {pd.__version__}")
 print(f"xgboost\t\t\t: {xgb.__version__}")
+!pip list | awk '/^(matplotlib)[^-]/ {print $1 "\t\t: " $2}'
 print(f"cupy\t\t\t: {cp.__version__}")
-!pip list | awk '/^(scikit-learn)/ {print $1 "\t\t: " $2}'
-!pip list | awk '/^(imbalanced-learn)/ {print $1 "\t: " $2}'
+!pip list | awk '/^(scipy)[^-]/ {print $1 "\t\t\t: " $2}'
+!pip list | awk '/^(scikit-learn)[^-]/ {print $1 "\t\t: " $2}'
+!pip list | awk '/^(imbalanced-learn)[^-]/ {print $1 "\t: " $2}'
 
 # Menetapkan Random Seed untuk Replikasi Konsisten (Tabel 3.2)
 RANDOM_SEED = 42
@@ -63,6 +66,10 @@ df_pima_clean[clinical_cols] = df_pima_clean[clinical_cols].replace(0, np.nan)
 # Imputasi menggunakan nilai median masing-masing kolom klinis
 df_pima_clean[clinical_cols] = df_pima_clean[clinical_cols].fillna(df_pima_clean[clinical_cols].median())
 print("Jumlah nilai 0 tidak valid setelah penanganan missing values:", (df_pima_clean[clinical_cols] == 0).sum().sum())
+# Tangani fitur-fitur integer (Hanya memproses sisa baris yang sudah valid)
+for col in ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'Age', 'Outcome']:
+    df_pima_clean[col] = df_pima_clean[col].astype(int)
+print("Verifikasi tipe data Diabetes Risk setelah encoding:\n", df_pima_clean.dtypes)
 
 # --- PEMBERSIHAN DATASET DIABETES RISK (SKALA BESAR) ---
 print("\n--- Membersihkan Dataset Diabetes Risk (Skala Besar) ---")
@@ -78,8 +85,7 @@ df_risk_clean['at_risk_diabetes'] = df_risk_clean['at_risk_diabetes'].astype(int
 activity_mapping = {'low': 0, 'moderate': 1, 'high': 2}
 df_risk_clean['physical_activity_level'] = df_risk_clean['physical_activity_level'].map(activity_mapping)
 # Tangani fitur-fitur integer (Hanya memproses sisa baris yang sudah valid)
-int_features = ['age', 'physical_activity_level', 'family_history', 'smoker']
-for col in int_features:
+for col in ['age', 'physical_activity_level', 'family_history', 'smoker']:
     df_risk_clean[col] = df_risk_clean[col].fillna(df_risk_clean[col].median()).astype(int)
 # Tangani fitur murni desimal/float (bmi & glucose_level)
 float_features = ['bmi', 'glucose_level']
@@ -174,22 +180,19 @@ def grey_wolf_optimizer(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_agents=20,
     d = 5
     # Inisialisasi populasi acak serigala sesuai batas rentang parameter (No. 1)
     X = initialize_agents(num_agents, d)
-        
-    # Inisialisasi posisi pemimpin alpha, beta, delta (No. 3 & No. #4 - Pembuatan variabel, nilai belum bisa digunakan)
+
+    # Inisialisasi posisi pemimpin alpha, beta, delta (No. 2 & No. 3)
     alpha_pos, alpha_score = np.zeros(d), float("inf")
     beta_pos, beta_score = np.zeros(d), float("inf")
     delta_pos, delta_score = np.zeros(d), float("inf")
-    loss_history = []
-    
+    loss_history = []; time_history = []
+
+    # Iterasi t (No. 4)
     for t in range(max_iter):
+        start_time = time.perf_counter_ns()
         # Penurunan linear komponen konvergensi 'a' dari 2 ke 0
-        # Untuk iterasi pertama, ini bertindak sebagai pemberian nilai (No. 2)
-        # Selanjutnya, ini bertindak sebagai perbaruan nilai
         a = 2.0 - (2.0 * t / max_iter)
-        
-        # Persiapan data untuk perhitungan agen serigala berikutnya
-        # Untuk iterasi pertama, ini bertindak sebagai pemberian nilai (No. 3 & No. 4)
-        # Selanjutnya, ini bertindak sebagai perbaruan nilai
+
         for i in range(num_agents):
             # Hitung nilai Fitness
             fitness = fitness_function(X[i], X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu)
@@ -207,8 +210,8 @@ def grey_wolf_optimizer(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_agents=20,
         for i in range(num_agents):
             XK = []
             # Perhitungan interaksi terhadap Alpha, Beta, dan Delta
-            for k, P in leaders_pos:
-                r1 = np.random.rand(d), r2 = np.random.rand(d)
+            for P in leaders_pos:
+                r1 = np.random.rand(d); r2 = np.random.rand(d)
                 A = 2 * a * r1 - a
                 C = 2 * r2
                 XK.append(P - A * np.abs(C * P - X[i]))
@@ -220,7 +223,8 @@ def grey_wolf_optimizer(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_agents=20,
             for j, key in enumerate(PARAMETERS):
                 X[i, j] = np.clip(new_position[j], BOUNDS[key][0], BOUNDS[key][1])
         loss_history.append(alpha_score)
-    return alpha_pos, loss_history
+        time_history.append(time.perf_counter_ns() - start_time)
+    return alpha_pos, loss_history, time_history
 
 # ------------------------------------------------------------------------------
 # 4.2. ALGORITMA WHALE OPTIMIZATION ALGORITHM (WOA) - MODEL PEMBANDING
@@ -232,10 +236,11 @@ def whale_optimization_algorithm(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_a
     
     # Inisialisasi posisi paus pemimpin (X*) (No. 3)
     leader_pos, leader_score = np.zeros(d), float("inf")
-    loss_history = []
+    loss_history = []; time_history = []
     
     # Iterasi t (No. 4)
     for t in range(max_iter):
+        start_time = time.perf_counter_ns()
         # Penurunan linear komponen konvergensi 'a' dari 2 ke 0
         a = 2.0 - (2.0 * t / max_iter)
         
@@ -247,7 +252,7 @@ def whale_optimization_algorithm(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_a
                 
         for i in range(num_agents):
             p = random.random(); l = np.random.uniform(-1, 1)
-            r1, r2 = np.random.rand(d), np.random.rand(d)
+            r1 = np.random.rand(d); r2 = np.random.rand(d)
             A = 2 * a * r1 - a; C = 2 * r2
             
             if p < 0.5:
@@ -271,81 +276,50 @@ def whale_optimization_algorithm(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val_cpu, num_a
             for j, key in enumerate(PARAMETERS):
                 X[i, j] = np.clip(X[i, j], BOUNDS[key][0], BOUNDS[key][1])
         loss_history.append(leader_score)
-    return leader_pos, loss_history
+        time_history.append(time.perf_counter_ns() - start_time)
+    return leader_pos, loss_history, time_history
 
 
 # ==============================================================================
-# FASE 5: STRATEGI EKSEKUSI, EVALUASI & PLOT GRAFIK KONVERGENSI (Subbab 3.4.4 & 3.5)
+# FASE 5: STRATEGI EKSEKUSI, EVALUASI, PLOT GRAFIK KONVERGENSI & UJI HIPOTESIS (Subbab 3.4.4 & 3.5)
 # ==============================================================================
-def run_full_experiment(X_train, X_test, y_train, y_test, dataset_name="PIMA"):
-    header = f" JALAN EKSPERIMEN UNTUK DATASET: {dataset_name} "
-    print(f"\n{'=' * len(header)}")
-    print(header)
-    print("=" * len(header))
-    
-    # Validasi internal split 75:25 dari data latih global
-    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=RANDOM_SEED)
-    
-    # Pindahkan data internal split ke GPU menggunakan CuPy
-    print("-> Memigrasikan data latih ke VRAM GPU...")
-    X_tr_gpu = cp.array(X_tr)
-    y_tr_gpu = cp.array(y_tr)
-    X_val_gpu = cp.array(X_val)
-    # y_val tetap di CPU karena dibutuhkan scikit-learn di fungsi fitness
-    
-    # Eksekusi Optimasi Menggunakan GWO (Usulan)
-    print("-> Memulai Pencarian Hiperparameter GWO...")
-    start = time.perf_counter_ns(); gwo_best_vector, gwo_loss = grey_wolf_optimizer(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val); gwo_time = time.perf_counter_ns() - start
-    gwo_params = map_vector_to_hyperparameters(gwo_best_vector)
-    
-    # Eksekusi Optimasi Menggunakan WOA (Re-running Baseline)
-    print("-> Memulai Pencarian Hiperparameter WOA...")
-    start = time.perf_counter_ns(); woa_best_vector, woa_loss = whale_optimization_algorithm(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val); woa_time = time.perf_counter_ns() - start
-    woa_params = map_vector_to_hyperparameters(woa_best_vector)
-    
-    # Evaluasi Model Akhir pada Test Set (Pindahkan data test global ke GPU)
-    X_train_gpu = cp.array(X_train)
-    y_train_gpu = cp.array(y_train)
-    X_test_gpu = cp.array(X_test)
-    
-    # Latih Model Akhir Berdasarkan Parameter Terbaik
-    model_gwo = xgb.XGBClassifier(**gwo_params, random_state=RANDOM_SEED, tree_method='hist', device='cuda').fit(X_train_gpu, y_train_gpu)
-    preds_gwo = cp.asnumpy(model_gwo.predict(X_test_gpu))
-    model_woa = xgb.XGBClassifier(**woa_params, random_state=RANDOM_SEED, tree_method='hist', device='cuda').fit(X_train_gpu, y_train_gpu)
-    preds_woa = cp.asnumpy(model_woa.predict(X_test_gpu))
-    
-    # Hitung Metrik Kebingungan (Confusion Matrix)
-    cm_gwo = confusion_matrix(y_test, preds_gwo)
-    cm_woa = confusion_matrix(y_test, preds_woa)
-    
-    tn_g, fp_g, fn_g, tp_g = cm_gwo.ravel()
-    tn_w, fp_w, fn_w, tp_w = cm_woa.ravel()
-    
-    # Penghitungan manual formula representatif sesuai deskripsi instrumen Bab 3
-    acc_g = (tp_g + tn_g) / (tp_g + tn_g + fp_g + fn_g)
-    acc_w = (tp_w + tn_w) / (tp_w + tn_w + fp_w + fn_w)
-    
-    prec_g = tp_g / (tp_g + fp_g) if (tp_g + fp_g) > 0 else 0
-    prec_w = tp_w / (tp_w + fp_w) if (tp_w + fp_w) > 0 else 0
-    
-    rec_g = tp_g / (tp_g + fn_g) if (tp_g + fn_g) > 0 else 0
-    rec_w = tp_w / (tp_w + fn_w) if (tp_w + fn_w) > 0 else 0
-    
-    f1_g = f1_score(y_test, preds_gwo, average='binary')
-    f1_w = f1_score(y_test, preds_woa, average='binary')
-    
-    # Cetak Hasil Akhir Evaluasi Eksperimen
+def safe_divide(a, b): 
+    return a / b if b != 0 else 0
+
+def search_hyperparameter(fn, X_tr_gpu, y_tr_gpu, X_val_gpu, y_val):
+    start = time.perf_counter_ns()
+    best_vector, loss, time_hist = fn(X_tr_gpu, y_tr_gpu, X_val_gpu, y_val)
+    end = time.perf_counter_ns() - start
+    params = map_vector_to_hyperparameters(best_vector)
+    return params, loss, end, time_hist
+
+def xgb_predict(params, X_train_gpu, y_train_gpu, X_test_gpu):
+    model = xgb.XGBClassifier(**params, random_state=RANDOM_SEED, tree_method='hist', device='cuda').fit(X_train_gpu, y_train_gpu)
+    preds = cp.asnumpy(model.predict(X_test_gpu))
+    return preds
+
+def count_performance_metrics(cm):
+    tn, fp, fn, tp = cm
+    acc = safe_divide(tp + tn, tp + tn + fp + fn)
+    prec = safe_divide(tp, tp + fp)
+    rec = safe_divide(tp, tp + fn)
+    f1 = safe_divide(2 * prec * rec, prec + rec)
+    return acc, prec, rec, f1
+
+def print_metrics_comparison(dataset_name, gwo_time, woa_time, cm_gwo, cm_woa):
+    perf_gwo = count_performance_metrics(cm_gwo.ravel()); perf_woa = count_performance_metrics(cm_woa.ravel())
     print(f"\n### METRIK PERFORMA AKHIR ({dataset_name}) ###")
     cols = ["GWO-XGBoost (Usulan)", "WOA-XGBoost (Pembanding)"]
     df = pd.DataFrame({
         "Metrik Indikator": ["Waktu Eksekusi", "Akurasi Akhir", "Presisi (Precision)", "Sensitivitas (Recall)", "F1-Score"],
-        cols[0]: [gwo_time, acc_g, prec_g, rec_g, f1_g],
-        cols[1]: [woa_time, acc_w, prec_w, rec_w, f1_w]
+        cols[0]: [gwo_time, *perf_gwo],
+        cols[1]: [woa_time, *perf_woa]
     })
     df[cols] = df[cols].apply(lambda x: x.index.map(lambda i: f"{x[i] / 1e9:.3f}s" if i == 0 else f"{x[i]:.4%}"), axis=0)
     print(df.to_markdown(tablefmt="github", index=False))
+    return perf_gwo[0], perf_woa[0]
 
-    # Visualisasi Confusion Matrix Berdampingan
+def show_confusion_matrices(dataset_name, cm_gwo, cm_woa):
     fig, ax = plt.subplots(1, 2, figsize=(12, 5), dpi=300)
     
     # Plot GWO-XGBoost
@@ -365,7 +339,7 @@ def run_full_experiment(X_train, X_test, y_train, y_test, dataset_name="PIMA"):
     plt.tight_layout()
     plt.show()
 
-    # Visualisasi Grafik Loss Curve
+def show_loss_curves(dataset_name, gwo_loss, woa_loss):
     plt.figure(figsize=(9, 5), dpi=300)
     plt.plot(range(1, len(gwo_loss) + 1), gwo_loss, label='GWO-XGBoost (Usulan)', color='#1f77b4', linewidth=2.5, marker='o', markevery=5)
     plt.plot(range(1, len(woa_loss) + 1), woa_loss, label='WOA-XGBoost (Pembanding)', color='#ff7f0e', linewidth=2.5, linestyle='--', marker='s', markevery=5)
@@ -376,6 +350,117 @@ def run_full_experiment(X_train, X_test, y_train, y_test, dataset_name="PIMA"):
     plt.legend(fontsize=10, loc='upper right')
     plt.tight_layout()
     plt.show()
+
+def run_hypothesis_testing(y_test, preds_gwo, preds_woa, acc_gwo, acc_woa, gwo_loss, woa_loss, gwo_time_hist, woa_time_hist):
+    print(f"\n=== UJI HIPOTESIS KOMPARATIF MULTI-ASPEK (Subbab 3.5.4) ===")
+    
+    # ------------------------------------------------------------------------------
+    # 1. HIPOTESIS 1 (H1): PENGUJIAN AKURASI KLASIFIKASI
+    # ------------------------------------------------------------------------------
+    print("\n[Uji Hipotesis 1 (H1): Akurasi Klasifikasi]")
+    gwo_correct = (preds_gwo == y_test)
+    woa_correct = (preds_woa == y_test)
+    
+    b = np.sum(gwo_correct & ~woa_correct)
+    c = np.sum(~gwo_correct & woa_correct)
+    
+    p_val_h1 = 2 * stats.binom.cdf(min(b, c), b + c, 0.5) if (b + c) > 0 else 1.0
+    print(f"-> Jumlah Sampel GWO Benar, WOA Salah (b) : {b}")
+    print(f"-> Jumlah Sampel GWO Salah, WOA Benar (c) : {c}")
+    print(f"-> McNemar Test P-Value                     : {p_val_h1:.4f}")
+    
+    if p_val_h1 < 0.05:
+        if acc_gwo > acc_woa:
+            print(f"Kesimpulan H1: Tolak H0. Model hibrida GWO-XGBoost ({acc_gwo:.2%}) terbukti lebih unggul secara signifikan dibandingkan model WOA-XGBoost ({acc_woa:.2%}).")
+        else:
+            print(f"Kesimpulan H1: Tolak H0. Model hibrida GWO-XGBoost ({acc_gwo:.2%}) tidak terbukti lebih unggul secara signifikan dibandingkan model WOA-XGBoost ({acc_woa:.2%}).")
+    else:
+        print(f"Kesimpulan H1: Gagal Tolak H0. Tidak ada perbedaan performa yang signifikan. Model hibrida GWO-XGBoost ({acc_gwo:.2%}) terbukti setara dengan model WOA-XGBoost ({acc_woa:.2%}).")
+        
+    # ------------------------------------------------------------------------------
+    # 2. HIPOTESIS 2 (H2): STABILITAS KONVERGENSI (LOSS CURVE)
+    # ------------------------------------------------------------------------------
+    print("\n[Uji Hipotesis 2 (H2): Stabilitas Konvergensi]")
+    _, p_val_h2_loss = stats.ttest_rel(gwo_loss, woa_loss)
+    
+    mean_loss_gwo = np.mean(gwo_loss); mean_loss_woa = np.mean(woa_loss)
+    print(f"-> Rata-rata Loss GWO (1 - F1-Score)        : {mean_loss_gwo:.4f}")
+    print(f"-> Rata-rata Loss WOA (1 - F1-Score)        : {mean_loss_woa:.4f}")
+    print(f"-> Paired t-test P-Value (Loss History)     : {p_val_h2_loss:.4f}")
+    
+    if p_val_h2_loss < 0.05:
+        if mean_loss_gwo < mean_loss_woa:
+            print("Kesimpulan H2: Tolak H0. Terbukti bahwa algoritma GWO menghasilkan performa optimasi yang lebih stabil secara signifikan dibanding WOA dalam melakukan tuning hiperparameter XGBoost.")
+        else:
+            print("Kesimpulan H2: Tolak H0. Tidak terbukti bahwa algoritma GWO menghasilkan performa optimasi yang lebih stabil secara signifikan dibanding WOA dalam melakukan tuning hiperparameter XGBoost.")
+    else:
+        print("Kesimpulan H2: Gagal Tolak H0. Tidak ada perbedaan performa yang signifikan. Terbukti bahwa algoritma GWO menghasilkan performa optimasi yang setara dengan WOA dalam melakukan tuning hiperparameter XGBoost.")
+
+    # ------------------------------------------------------------------------------
+    # 3. HIPOTESIS 3 (H3): EFISIENSI WAKTU KOMPUTASI PER ITERASI
+    # ------------------------------------------------------------------------------
+    print("\n[Uji Hipotesis 3 (H3): Efisiensi Waktu Komputasi]")
+    # Mengubah nanodetik ke milidetik untuk pengujian matriks yang lebih sensitif
+    gwo_time_ms = np.array(gwo_time_hist) / 1e6
+    woa_time_ms = np.array(woa_time_hist) / 1e6
+    
+    _, p_val_h3_time = stats.ttest_rel(gwo_time_ms, woa_time_ms)
+    time_saved_pct = ((np.sum(woa_time_ms) - np.sum(gwo_time_ms)) / np.sum(woa_time_ms)) * 100
+    
+    mean_time_gwo = np.mean(gwo_time_ms); mean_time_woa = np.mean(woa_time_ms)
+    print(f"-> Rata-rata Waktu Komputasi GWO            : {mean_time_gwo/1000:.3f}s")
+    print(f"-> Rata-rata Waktu Komputasi WOA            : {mean_time_woa/1000:.3f}s")
+    print(f"-> Paired t-test P-Value (Time History)     : {p_val_h3_time:.4f}")
+    
+    if p_val_h3_time < 0.05:
+        if mean_time_gwo < mean_time_woa:
+            print(f"Kesimpulan H3: Tolak H0. Terbukti bahwa algoritma GWO memiliki efisiensi waktu komputasi yang lebih baik secara signifikan ({time_saved_pct:.2f}% lebih cepat) dibanding WOA dalam melakukan tuning hiperparameter XGBoost.")
+        else:
+            print(f"Kesimpulan H3: Tolak H0. Tidak terbukti bahwa algoritma GWO memiliki efisiensi waktu komputasi yang lebih baik secara signifikan ({np.abs(time_saved_pct):.2f}% lebih lambat) dibanding WOA dalam melakukan tuning hiperparameter XGBoost.")
+    else:
+        print("Kesimpulan H3: Gagal Tolak H0. Tidak ada perbedaan efisiensi waktu komputasi yang signifikan. Terbukti bahwa algoritma GWO menghasilkan memiliki efisiensi waktu komputasi yang setara dengan WOA dalam melakukan tuning hiperparameter XGBoost.")
+
+def run_full_experiment(X_train, X_test, y_train, y_test, dataset_name="PIMA"):
+    header = f" JALAN EKSPERIMEN UNTUK DATASET: {dataset_name} "
+    print(f"\n{'=' * len(header)}")
+    print(header)
+    print("=" * len(header))
+    
+    # Validasi internal split 75:25 dari data latih global
+    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=RANDOM_SEED)
+    
+    # Pindahkan data internal split ke GPU menggunakan CuPy
+    print("-> Memigrasikan data latih ke VRAM GPU...")
+    X_tr_gpu = cp.array(X_tr); y_tr_gpu = cp.array(y_tr); X_val_gpu = cp.array(X_val)
+    
+    # Eksekusi Optimasi Menggunakan GWO (Usulan)
+    print("-> Memulai Pencarian Hiperparameter GWO...")
+    gwo_params, gwo_loss, gwo_time, gwo_time_hist = search_hyperparameter(grey_wolf_optimizer, X_tr_gpu, y_tr_gpu, X_val_gpu, y_val)
+    
+    # Eksekusi Optimasi Menggunakan WOA (Re-running Baseline)
+    print("-> Memulai Pencarian Hiperparameter WOA...")
+    woa_params, woa_loss, woa_time, woa_time_hist = search_hyperparameter(whale_optimization_algorithm, X_tr_gpu, y_tr_gpu, X_val_gpu, y_val)
+    
+    # Evaluasi Model Akhir pada Test Set (Pindahkan data test global ke GPU)
+    X_train_gpu = cp.array(X_train); y_train_gpu = cp.array(y_train); X_test_gpu = cp.array(X_test)
+    
+    # Latih Model Akhir Berdasarkan Parameter Terbaik
+    preds_gwo = xgb_predict(gwo_params, X_train_gpu, y_train_gpu, X_test_gpu)
+    preds_woa = xgb_predict(woa_params, X_train_gpu, y_train_gpu, X_test_gpu)
+    
+    # Hitung Metrik Kebingungan (Confusion Matrix)
+    cm_gwo = confusion_matrix(y_test, preds_gwo)
+    cm_woa = confusion_matrix(y_test, preds_woa)
+    
+    # Cetak Hasil Akhir Evaluasi Eksperimen
+    acc_gwo, acc_woa = print_metrics_comparison(dataset_name, gwo_time, woa_time, cm_gwo, cm_woa)
+    # Visualisasi Confusion Matrix Berdampingan
+    show_confusion_matrices(dataset_name, cm_gwo, cm_woa)
+    # Visualisasi Grafik Loss Curve
+    show_loss_curves(dataset_name, gwo_loss, woa_loss)
+    
+    # Analisis Komparatif Uji Hipotesis (Subbab 3.5.4)
+    run_hypothesis_testing(y_test, preds_gwo, preds_woa, acc_gwo, acc_woa, gwo_loss, woa_loss, gwo_time_hist, woa_time_hist)
 
 # Menjalankan pengujian secara berturut-turut untuk kedua skala data
 run_full_experiment(X_train_p, X_test_p, y_train_p, y_test_p, dataset_name="PIMA Indians Diabetes Dataset")
